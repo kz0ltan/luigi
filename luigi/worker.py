@@ -57,7 +57,7 @@ from luigi.target import Target
 from luigi.task import Task, flatten, getpaths, Config
 from luigi.task_register import TaskClassException
 from luigi.task_status import RUNNING
-from luigi.parameter import BoolParameter, FloatParameter, IntParameter, OptionalParameter, Parameter, TimeDeltaParameter
+from luigi.parameter import BoolParameter, FloatParameter, IntParameter, OptionalParameter, Parameter, TimeDeltaParameter, ListParameter
 
 import json
 
@@ -461,6 +461,9 @@ class worker(Config):
                                              'used for obtaining high level customizable monitoring or logging of '
                                              'each individual Task run.')
 
+    resources = ListParameter(default='',
+            config_path=dict(section='core', name='worker-resrouces'),
+            description='Resources available for the worker')
 
 class KeepAliveThread(threading.Thread):
     """
@@ -743,6 +746,7 @@ class Worker:
             queue = DequeQueue()
             pool = SingleProcessPool()
         self._validate_task(task)
+        # check_complete(task, out_queue) -> puts into queue if task is complete
         pool.apply_async(check_complete, [task, queue])
 
         # we track queue size ourselves because len(queue) won't work for multiprocessing
@@ -753,6 +757,7 @@ class Worker:
                 current = queue.get()
                 queue_size -= 1
                 item, is_complete = current
+                # add any dependencies if found
                 for next in self._add(item, is_complete):
                     if next.task_id not in seen:
                         self._validate_task(next)
@@ -857,7 +862,9 @@ class Worker:
 
                 deps = [d.task_id for d in deps]
 
+        # add to local scheduled_tasks
         self._scheduled_tasks[task.task_id] = task
+        # add to scheduler
         self._add_task(
             worker=self._id,
             task_id=task.task_id,
@@ -872,6 +879,7 @@ class Worker:
             batchable=task.batchable,
             retry_policy_dict=_get_retry_policy_dict(task),
             accepts_messages=task.accepts_messages,
+            worker_resources=task.worker_resources,
         )
 
     def _validate_dependency(self, dependency):
@@ -948,6 +956,7 @@ class Worker:
                 host=self.host,
                 assistant=self._assistant,
                 current_tasks=list(self._running_tasks.keys()),
+                worker_resources=self._config.resources,
             )
         else:
             logger.debug("Checking if tasks are still pending")
@@ -1064,6 +1073,7 @@ class Worker:
             except Queue.Empty:
                 return
 
+
             task = self._scheduled_tasks[task_id]
             if not task or task_id not in self._running_tasks:
                 continue
@@ -1075,6 +1085,7 @@ class Worker:
             if status == FAILED and not external_task_retryable:
                 self._email_task_failure(task, expl)
 
+            # add new requirements
             new_deps = []
             if new_requirements:
                 new_req = [load_task(module, name, params)
@@ -1083,6 +1094,7 @@ class Worker:
                     self.add(t)
                 new_deps = [t.task_id for t in new_req]
 
+            # add task
             self._add_task(worker=self._id,
                            task_id=task_id,
                            status=status,
@@ -1094,7 +1106,8 @@ class Worker:
                            module=task.task_module,
                            new_deps=new_deps,
                            assistant=self._assistant,
-                           retry_policy_dict=_get_retry_policy_dict(task))
+                           retry_policy_dict=_get_retry_policy_dict(task),
+                           worker_resources=task.worker_resources)
 
             self._running_tasks.pop(task_id)
 
@@ -1180,18 +1193,22 @@ class Worker:
         self._add_worker()
 
         while True:
+            # while something is running
             while len(self._running_tasks) >= self.worker_processes > 0:
                 logger.debug('%d running tasks, waiting for next task to finish', len(self._running_tasks))
                 self._handle_next_task()
 
             get_work_response = self._get_work()
 
+            # if scheduler shut down this worker
             if get_work_response.worker_state == WORKER_STATE_DISABLED:
                 self._start_phasing_out()
 
+            # if scheduler didn't send a task to run
             if get_work_response.task_id is None:
                 if not self._stop_requesting_work:
                     self._log_remote_tasks(get_work_response)
+                # if no tasks are running currently
                 if len(self._running_tasks) == 0:
                     self._idle_since = self._idle_since or datetime.datetime.now()
                     if self._keep_alive(get_work_response):

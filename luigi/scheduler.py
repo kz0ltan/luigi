@@ -234,7 +234,7 @@ class OrderedSet(MutableSet):
 class Task:
     def __init__(self, task_id, status, deps, resources=None, priority=0, family='', module=None,
                  params=None, param_visibilities=None, accepts_messages=False, tracking_url=None, status_message=None,
-                 progress_percentage=None, retry_policy='notoptional'):
+                 progress_percentage=None, retry_policy='notoptional', worker_resources=None):
         self.id = task_id
         self.stakeholders = set()  # workers ids that are somehow related to this task (i.e. don't prune while any of these workers are still active)
         self.workers = OrderedSet()  # workers ids that can perform task - task is 'BROKEN' if none of these workers are active
@@ -271,6 +271,7 @@ class Task:
         self.runnable = False
         self.batchable = False
         self.batch_id = None
+        self.worker_resources = worker_resources
 
     def __repr__(self):
         return "Task(%r)" % vars(self)
@@ -793,9 +794,11 @@ class Scheduler:
     @rpc_method()
     def add_task(self, task_id=None, status=PENDING, runnable=True,
                  deps=None, new_deps=None, expl=None, resources=None,
-                 priority=0, family='', module=None, params=None, param_visibilities=None, accepts_messages=False,
-                 assistant=False, tracking_url=None, worker=None, batchable=None,
-                 batch_id=None, retry_policy_dict=None, owners=None, **kwargs):
+                 priority=0, family='', module=None, params=None,
+                 param_visibilities=None, accepts_messages=False,
+                 assistant=False, tracking_url=None, worker=None,
+                 batchable=None, batch_id=None, retry_policy_dict=None,
+                 owners=None, worker_resources=None, **kwargs):
         """
         * add task identified by task_id if it doesn't exist
         * if deps is not None, update dependency list
@@ -803,25 +806,30 @@ class Scheduler:
         * add additional workers/stakeholders
         * update priority when needed
         """
+        # update worker last check-in
         assert worker is not None
         worker_id = worker
         worker = self._update_worker(worker_id)
 
         resources = {} if resources is None else resources.copy()
+        worker_resources = [] if worker_resources is None else worker_resources.copy()
 
         if retry_policy_dict is None:
             retry_policy_dict = {}
 
         retry_policy = self._generate_retry_policy(retry_policy_dict)
 
+        # default task
         if worker.enabled:
             _default_task = self._make_task(
                 task_id=task_id, status=PENDING, deps=deps, resources=resources,
                 priority=priority, family=family, module=module, params=params, param_visibilities=param_visibilities,
+                worker_resources=worker_resources,
             )
         else:
             _default_task = None
 
+        # get existing / create default task
         task = self._state.get_task(task_id, setdefault=_default_task)
 
         if task is None or (task.status != RUNNING and not worker.enabled):
@@ -913,6 +921,9 @@ class Scheduler:
 
         if resources is not None:
             task.resources = resources
+
+        if worker_resources is not None:
+            task.worker_resources = worker_resources
 
         if worker.enabled and not assistant:
             task.stakeholders.add(worker_id)
@@ -1113,7 +1124,8 @@ class Scheduler:
         }
 
     @rpc_method(allow_null=False)
-    def get_work(self, host=None, assistant=False, current_tasks=None, worker=None, **kwargs):
+    def get_work(self, host=None, assistant=False, current_tasks=None,
+            worker=None, worker_resources=None, **kwargs):
         # TODO: remove any expired nodes
 
         # Algo: iterate over all nodes, find the highest priority node no dependencies and available
@@ -1165,7 +1177,8 @@ class Scheduler:
         worker = self._state.get_worker(worker_id)
         if self._paused:
             relevant_tasks = []
-        elif worker.is_trivial_worker(self._state):
+        elif worker.is_trivial_worker(self._state) and not worker_resources:
+            # If it's not an assistant having only tasks that are without requirements.
             relevant_tasks = worker.get_tasks(self._state, PENDING, RUNNING)
             used_resources = collections.defaultdict(int)
             greedy_workers = dict()  # If there's no resources, then they can grab any task
@@ -1180,6 +1193,7 @@ class Scheduler:
         tasks.sort(key=self._rank, reverse=True)
 
         for task in tasks:
+            # batched task
             if (best_task and batched_params and task.family == best_task.family and
                     len(batched_tasks) < max_batch_size and task.is_batchable() and all(
                     task.params.get(name) == value for name, value in unbatched_params.items()) and
@@ -1196,8 +1210,17 @@ class Scheduler:
                     greedy_resources[resource] += amount
 
             if self._schedulable(task) and self._has_resources(task.resources, greedy_resources):
+
+                # task.workers: workers ids that can perform task - task is
+                # 'BROKEN' if none of these workers are active
                 in_workers = (assistant and task.runnable) or worker_id in task.workers
-                if in_workers and self._has_resources(task.resources, used_resources):
+
+                worker_has_resources = all(r in worker_resources for r in task.worker_resources)
+
+                # in_workers check has been removed as the worker can load the
+                # task dynamically, even if it didn't schedule it before
+                #if in_workers and self._has_resources(task.resources, used_resources):
+                if self._has_resources(task.resources, used_resources) and worker_has_resources:
                     best_task = task
                     batch_param_names, max_batch_size = self._state.get_batcher(
                         worker_id, task.family)
